@@ -1,0 +1,8 @@
+# Keep source and shell scripts portable across Windows, Linux and macOS.
+* text=auto
+*.sh text eol=lf
+Makefile text eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

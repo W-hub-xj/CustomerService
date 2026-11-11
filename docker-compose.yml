@@ -1,0 +1,80 @@
+name: customer-service
+
+services:
+  mysql:
+    image: mysql:8   # MySQL 8 系列
+    container_name: customer-service-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: CustomerService
+    ports:
+      - "3306:3306"
+    volumes:
+      - customer-service-mysql-data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d:ro   # 首启按文件名序执行 001_schema.sql → 002_seed.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Milvus Standalone(唯 Standalone 支持原生 BM25 全文检索)+ etcd + minio
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.16
+    container_name: customer-service-milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - customer-service-milvus-etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+    container_name: customer-service-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - customer-service-milvus-minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.6.22
+    container_name: customer-service-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - customer-service-milvus-data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 5
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+
+volumes:
+  customer-service-mysql-data:
+  customer-service-milvus-etcd:
+  customer-service-milvus-minio:
+  customer-service-milvus-data:

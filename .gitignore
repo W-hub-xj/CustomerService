@@ -1,0 +1,38 @@
+# Python and development tools
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+
+# Local credentials; keep only the public configuration template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime databases, reports, training outputs and logs
+data/*.db*
+data/*.sqlite*
+data/retrieval/
+data/observability/
+data/topic_classifier/
+data/*.log
+log/
+logs/
+*.pid
+
+# Local development notes and OS files
+/docs/
+.superpowers/
+dev-notes/
+.DS_Store
+Thumbs.db

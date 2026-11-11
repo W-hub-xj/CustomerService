@@ -1,0 +1,193 @@
+-- CustomerService 数据库初始化
+-- 面向空数据库,一次性建立完整表结构。由客户端或 MYSQL_DATABASE 选择目标数据库。
+-- 按依赖顺序创建表;知识分块的前后指针为自引用外键。
+-- 所有表使用 InnoDB / utf8mb4;向量索引由应用在 Milvus 中维护。
+-- 本文件用于首次初始化,不对已有数据库执行迁移或历史数据更新。
+
+SET NAMES utf8mb4;
+
+-- 会话及滚动摘要
+CREATE TABLE conversations (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '会话主键',
+  user_id     VARCHAR(64)     NOT NULL                COMMENT '用户标识',
+  status      ENUM('进行中','已转人工','已结束') NOT NULL DEFAULT '进行中' COMMENT '处理状态',
+  summary             TEXT            NULL COMMENT '早期轮次滚动摘要,接在上下文前头',
+  summary_upto_msg_id BIGINT UNSIGNED NULL COMMENT '摘要已覆盖到哪条消息,滑窗从其后接原文',
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开启时间',
+  updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (id),
+  KEY idx_user_id (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客服会话';
+
+-- 会话消息流水
+CREATE TABLE messages (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '消息主键',
+  conversation_id BIGINT UNSIGNED NOT NULL                COMMENT '所属会话',
+  role            ENUM('user','assistant','tool') NOT NULL COMMENT '角色:用户/助手/工具结果',
+  content         TEXT            NULL                     COMMENT '消息正文,assistant 纯工具调用时可为空',
+  tool_calls      JSON            NULL                     COMMENT 'assistant 消息带的工具调用申请单',
+  tool_call_id    VARCHAR(64)     NULL                     COMMENT 'tool 消息对应的申请单 id,回灌时对号入座',
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '产生时间',
+  PRIMARY KEY (id),
+  KEY idx_conversation_id (conversation_id),
+  CONSTRAINT fk_messages_conversation FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话消息流水';
+
+-- 基础常见问答
+CREATE TABLE faq (
+  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'FAQ 主键',
+  question    VARCHAR(512)    NOT NULL                COMMENT '问题',
+  answer      TEXT            NOT NULL                COMMENT '答案',
+  category    VARCHAR(64)     NOT NULL                COMMENT '分类',
+  created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (id),
+  KEY idx_category (category)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='常见问答';
+
+-- 人工工单
+CREATE TABLE tickets (
+  ticket_no       VARCHAR(32)     NOT NULL                COMMENT '工单号,如 T20260701008',
+  conversation_id BIGINT UNSIGNED NOT NULL                COMMENT '关联会话,可倒查当时聊了什么',
+  description     TEXT            NOT NULL                COMMENT '问题描述',
+  ticket_type     ENUM('售后','投诉','咨询','退款') NOT NULL     COMMENT '工单类型',
+  status          ENUM('待处理','已处理') NOT NULL DEFAULT '待处理' COMMENT '处理状态',
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (ticket_no),
+  KEY idx_conversation_id (conversation_id),
+  CONSTRAINT fk_tickets_conversation FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='人工工单';
+
+-- 知识库原文及向量双写状态
+CREATE TABLE knowledge_chunks (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'chunk 主键,与 Milvus 集合主键对齐',
+  category         VARCHAR(255)    NOT NULL                COMMENT '分类 / 上级标题路径,进向量化文本',
+  questions        TEXT            NOT NULL                COMMENT '问法或文档小节标题,多个问法换行分隔,进向量化文本',
+  answer           TEXT            NOT NULL                COMMENT '正文答案,进向量化文本',
+  section_path     VARCHAR(512)    NULL                    COMMENT '文档标题路径,元数据,溯源用,不进向量',
+  content_type     VARCHAR(32)     NULL                    COMMENT '内容类型:faq / policy / manual 等,元数据',
+  is_key_clause    TINYINT(1)      NOT NULL DEFAULT 0      COMMENT '是否关键条款,0 否 1 是,元数据',
+  prev_chunk_id    BIGINT UNSIGNED NULL                    COMMENT '前一块指针,元数据',
+  next_chunk_id    BIGINT UNSIGNED NULL                    COMMENT '后一块指针,元数据',
+  vector_id        VARCHAR(64)     NULL                    COMMENT 'Milvus 集合 knowledge 里的主键,写入后回填',
+  vectorize_status ENUM('pending','done') NOT NULL DEFAULT 'pending' COMMENT '待向量化 / 已向量化,双写幂等靠它',
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (id),
+  KEY idx_category (category),
+  KEY idx_vectorize_status (vectorize_status),
+  CONSTRAINT fk_chunks_prev FOREIGN KEY (prev_chunk_id) REFERENCES knowledge_chunks (id) ON DELETE SET NULL,
+  CONSTRAINT fk_chunks_next FOREIGN KEY (next_chunk_id) REFERENCES knowledge_chunks (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识库 chunk 原文权威源';
+
+-- 历史会话抽取、去重和人工审核暂存
+CREATE TABLE qa_extraction_staging (
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '暂存行主键',
+  batch_no         VARCHAR(64)     NOT NULL                COMMENT '抽取批次号,一批几十个会话跑一次,分批防串味、按批追溯',
+  source_ref       VARCHAR(255)    NULL                    COMMENT '来源会话 / 导出文件标识,溯源用,不入最终知识库',
+  question         TEXT            NOT NULL                COMMENT 'LLM 从会话抽出的用户问法',
+  answer           TEXT            NOT NULL                COMMENT 'LLM 从会话抽出的客服答案',
+  status           ENUM('extracted','kept','discarded','approved','rejected') NOT NULL DEFAULT 'extracted' COMMENT '已抽出待去重 / 去重保留待人审 / 去重丢弃 / 人工采纳已入库 / 人工弃用',
+  created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '抽取写入时间',
+  PRIMARY KEY (id),
+  KEY idx_batch_no (batch_no),
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='历史对话抽 QA 的离线中转暂存表:分批抽取、整体去重,保留项入 knowledge_chunks,建库完成可清空';
+
+-- 内置工具和 MCP 工具调用审计
+CREATE TABLE tool_audit_logs (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '审计主键',
+  conversation_id BIGINT UNSIGNED NULL                    COMMENT '所属会话,无会话上下文的调用为 NULL',
+  tool_call_id    VARCHAR(64)     NULL                    COMMENT '模型申请单 id,可对回 messages 流水',
+  tool_name       VARCHAR(128)    NOT NULL                COMMENT '工具名',
+  tool_source     ENUM('builtin','mcp') NOT NULL          COMMENT '工具来源:内置 / MCP 接入',
+  mcp_server      VARCHAR(64)     NULL                    COMMENT '来源 MCP Server 名,内置工具为 NULL',
+  arguments       JSON            NULL                    COMMENT '调用参数',
+  result_summary  TEXT            NULL                    COMMENT '返回结果,过长截断存摘要',
+  status          ENUM('成功','失败','超时','校验拦下','权限拒绝') NOT NULL COMMENT '本次调用结局',
+  error_message   VARCHAR(512)    NULL                    COMMENT '失败 / 拦下时的原因说明',
+  retry_count     TINYINT UNSIGNED NOT NULL DEFAULT 0     COMMENT '实际重试次数,写操作默认不重试恒为 0',
+  duration_ms     INT UNSIGNED    NULL                    COMMENT '耗时毫秒',
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '调用时间',
+  PRIMARY KEY (id),
+  KEY idx_conversation_id (conversation_id),
+  KEY idx_tool_name (tool_name),
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='工具调用审计留痕';
+
+-- 标准化去重后的知识缺口审核队列
+CREATE TABLE review_queue (
+  id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '缺口主键,也是查重命中要返回的 matched_question_id',
+  normalized_question VARCHAR(512)    NOT NULL                COMMENT '标准化后的 FAQ 式问题',
+  ai_suggested_answer TEXT            NULL                    COMMENT '模型生成的示例答案,备查',
+  occurrence_count    INT UNSIGNED    NOT NULL DEFAULT 1      COMMENT '出现次数,查重命中累加,越高越该优先补',
+  review_status       ENUM('待审','通过','驳回') NOT NULL DEFAULT '待审' COMMENT '人工审核状态',
+  approved_answer     TEXT            NULL                    COMMENT '审核通过时补的核准答案,通过知识入库流程写回知识库',
+  created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入队时间',
+  updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  PRIMARY KEY (id),
+  KEY idx_review_status (review_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='飞轮待审队列';
+
+-- 低置信度问题及召回快照、审核归并关系
+CREATE TABLE low_confidence_questions (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+  conversation_id BIGINT UNSIGNED NULL                    COMMENT '来源会话',
+  raw_question    TEXT            NOT NULL                COMMENT '用户原话,带情绪口语',
+  source          ENUM('retrieval_low_conf','self_check','user_feedback') NOT NULL COMMENT '入池入口:检索证据低 / 生成自评不足 / 用户反馈未解决',
+  reason          TEXT            NULL                    COMMENT '判不能的原因,留作复盘',
+  retrieved_chunks  JSON            NULL COMMENT '落池时的召回片段快照:Top 几条的原文与得分,审核页展示用;没走检索为 NULL',
+  matched_review_id BIGINT UNSIGNED NULL COMMENT '查重后归并到的缺口,指向 review_queue.id',
+  created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入池时间',
+  PRIMARY KEY (id),
+  KEY idx_source (source),
+  KEY idx_created_at (created_at),
+  KEY idx_matched_review_id (matched_review_id),
+  CONSTRAINT fk_lcq_review FOREIGN KEY (matched_review_id) REFERENCES review_queue (id) ON DELETE SET NULL,
+  CONSTRAINT fk_lcq_conversation FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='低置信度问题池';
+
+-- 答案忠实度个案跟踪
+CREATE TABLE faith_cases (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+  eval_id       VARCHAR(16)     NOT NULL                COMMENT '评估集题号,如 A43;一题一行',
+  bucket        VARCHAR(24)     NOT NULL                COMMENT '题目所属桶:A_policy / B_model / C_colloquial / E_multi',
+  query         VARCHAR(512)    NOT NULL                COMMENT '用户问题原文',
+  strategy      VARCHAR(24)     NOT NULL DEFAULT 'hybrid_rerank' COMMENT '产出这条答案的检索策略',
+  answer        TEXT            NOT NULL                COMMENT '被判编造的那版生成答案原文',
+  reason        TEXT            NOT NULL                COMMENT '裁判给的理由:编在哪一句',
+  citations     JSON            NULL                    COMMENT '这一轮喂给模型的 Top-K 证据全集快照:[{n,chunk_id,section_path,question,answer}];答案里的角标 [n] 就是这份列表的序号,答案通常只引用其中两三条;老数据没记为 NULL',
+  judge_model   VARCHAR(64)     NULL                    COMMENT '判这条的裁判模型',
+  status        ENUM('未解决','已解决','无需解决') NOT NULL DEFAULT '未解决' COMMENT '处置状态,人工点按钮改',
+  seen_count    INT UNSIGNED    NOT NULL DEFAULT 1      COMMENT '被判编造的累计次数(跨轮)',
+  first_seen_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '第一次被判编造的时间',
+  last_seen_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最近一次被判编造的时间',
+  resolution    VARCHAR(300)    NULL                    COMMENT '处置说明:标已解决要写清怎么解决的,标无需解决要写清为什么不用改;退回未解决时清空。空着的处置在台账上等于没有交代',
+  resolved_at   DATETIME        NULL                    COMMENT '最近一次被标为已解决/无需解决的时间;复发后仍保留,用来标「复发」',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_eval_id (eval_id),
+  KEY idx_status (status),
+  KEY idx_last_seen_at (last_seen_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='忠实度编造个案台账';
+
+-- 自动化评估轮次及指标
+CREATE TABLE eval_runs (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '评估轮次主键',
+  triggered_by ENUM('定时','手动') NOT NULL DEFAULT '定时' COMMENT '这轮怎么起的:定时任务,或某次改动后手动跑',
+  dataset_size INT UNSIGNED    NOT NULL                COMMENT '这轮跑的评估集条数',
+  metrics      JSON            NOT NULL                COMMENT '各指标分数,如 {"recall_at_k":0.82,"mrr":0.71,"faithfulness":0.90}',
+  created_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '跑完落表时间',
+  PRIMARY KEY (id),
+  KEY idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='自动化评估流水线轮次结果';
+
+-- 问题主题分类结果
+CREATE TABLE topic_classifications (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+  question_id   BIGINT UNSIGNED NOT NULL                COMMENT '归类的问题,指向 low_confidence_questions.id',
+  labels        JSON            NOT NULL                COMMENT '多标签,17 类权威类目里命中的若干个',
+  classified_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '归类时间',
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_question_id (question_id),
+  CONSTRAINT fk_topic_question FOREIGN KEY (question_id) REFERENCES low_confidence_questions (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='主题分类结果';
